@@ -22,10 +22,7 @@ from sglang.srt.utils import (
     is_hip,
 )
 
-is_cuda = is_cuda_available()
 is_hip_flag = is_hip()
-if is_cuda:
-    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +32,20 @@ enable_moe_align_block_size_triton = bool(
     int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
 )
 
+_is_cuda = torch.cuda.is_available() and torch.version.cuda
+_is_rocm = torch.cuda.is_available() and torch.version.hip
+
+if _is_cuda:
+    from sgl_kernel import gelu_and_mul, silu_and_mul
+
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+if _is_cuda or _is_rocm:
+    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
+import numpy as np
 
 @triton.jit
 def fused_moe_kernel(
@@ -44,6 +55,8 @@ def fused_moe_kernel(
     c_ptr,
     a_scale_ptr,
     b_scale_ptr,
+    b_q4_scale_ptr,
+    b_q4_zero_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
@@ -51,6 +64,7 @@ def fused_moe_kernel(
     # Matrix dimensions
     N,
     K,
+    HALF_K,
     EM,
     num_valid_tokens,
     # The stride variables represent how much to increase the ptr by when
@@ -69,6 +83,12 @@ def fused_moe_kernel(
     stride_bse,
     stride_bsk,
     stride_bsn,
+    stride_bqse,
+    stride_bqsk,
+    stride_bqsn,
+    stride_bqze,
+    stride_bqzk,
+    stride_bqzn,
     # Block size for block-wise quantization
     group_n: tl.constexpr,
     group_k: tl.constexpr,
@@ -80,6 +100,7 @@ def fused_moe_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    use_int4_w4a8: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
@@ -154,7 +175,29 @@ def fused_moe_kernel(
         )
         b_scale = tl.load(b_scale_ptrs)
 
-    if use_fp8_w8a8:
+    if use_int4_w4a8:
+        if group_k > 0 and group_n > 0:
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            offs_bsn = offs_bn // group_n
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+            )
+            b_q4_scale_ptrs = (
+                b_q4_scale_ptr + off_experts * stride_bqse + offs_bn * stride_bqsn
+            )
+            b_q4_zero_ptrs = (
+                b_q4_zero_ptr + off_experts * stride_bqze + offs_bn * stride_bqzn
+            )
+        else:
+            a_scale = tl.load(a_scale_ptr)
+            b_scale = tl.load(b_scale_ptr + off_experts)
+            b_q4_scale_ptrs = (
+                b_q4_scale_ptr + off_experts * stride_bqse + offs_bn * stride_bqsn
+            )
+            b_q4_zero_ptrs = (
+                b_q4_zero_ptr + off_experts * stride_bqze + offs_bn * stride_bqzn
+            )
+    elif use_fp8_w8a8:
         if group_k > 0 and group_n > 0:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
             offs_bsn = offs_bn // group_n
@@ -172,7 +215,12 @@ def fused_moe_kernel(
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    if use_int4_w4a8:
+        TOTAL_K = HALF_K
+    else:
+        TOTAL_K = K
+
+    for k in range(0, tl.cdiv(TOTAL_K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
         if even_Ks:
@@ -183,16 +231,93 @@ def fused_moe_kernel(
             )
             b = tl.load(b_ptrs)
         else:
-            a = tl.load(
-                a_ptrs,
-                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-                other=0.0,
-            )
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            if use_int4_w4a8:
+                a = tl.load(
+                    a_ptrs,
+                    mask=token_mask[:, None] & (offs_k[None, :] < K - k * 2 * BLOCK_SIZE_K),
+                    other=0.0,
+                )
+                b = tl.load(b_ptrs, mask=offs_k[:, None] < TOTAL_K - k * BLOCK_SIZE_K, other=0.0)
+            else:
+                a = tl.load(
+                    a_ptrs,
+                    mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                    other=0.0,
+                )
+                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
+        elif use_int4_w4a8:
+            if group_k > 0 and group_n > 0:
+                cur_k = k * 2
+                k_start = cur_k * BLOCK_SIZE_K
+                offs_ks = k_start // group_k
+                a_scale = tl.load(
+                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                )
+                b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+
+                k_start = k * BLOCK_SIZE_K
+                offs_kz = k_start // group_k
+                b_q4_scale =  tl.load(b_q4_scale_ptrs + offs_ks * stride_bqsk)
+                b_q4_zero =  tl.load(b_q4_zero_ptrs + offs_kz * stride_bqzk)
+
+                b_low = b & 0xF
+                b_low_qz = b_q4_zero & 0xF
+                b_low_fp8 = ((b_low - b_low_qz) * b_q4_scale).to(tl.float8e4nv)
+                accumulator += tl.dot(a, b_low_fp8) * a_scale[:, None] * b_scale[None, :]
+                a_ptrs += BLOCK_SIZE_K * stride_ak
+                if even_Ks:
+                    a = tl.load(
+                        a_ptrs,
+                        mask=token_mask[:, None],
+                        other=0.0,
+                    )
+                else:
+                    a = tl.load(
+                        a_ptrs,
+                        mask=token_mask[:, None] & (offs_k[None, :] < K - (k * 2 + 1) * BLOCK_SIZE_K),
+                        other=0.0,
+                    )
+                cur_k = cur_k + 1
+                k_start = cur_k * BLOCK_SIZE_K
+                offs_ks = k_start // group_k
+                a_scale = tl.load(
+                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                )
+                b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                b_q4_scale =  tl.load(b_q4_scale_ptrs + offs_ks * stride_bqsk)
+
+                b_high = (b >> 4) & 0xF
+                b_high_qz = (b_q4_zero >> 4) & 0xF
+                b_high_fp8 = ((b_high - b_high_qz) * b_q4_scale).to(tl.float8e4nv)
+                accumulator += tl.dot(a, b_high_fp8) * a_scale[:, None] * b_scale[None, :]
+            else:
+                b_q4_scale = tl.load(b_q4_scale_ptrs)
+                b_q4_zero = tl.load(b_q4_zero_ptrs)
+
+                b_low = b & 0xF
+                b_low_fp8 = ((b_low - b_q4_zero) * b_q4_scale).to(tl.float8e4nv)
+                accumulator = tl.dot(a, b_low_fp8, acc=accumulator)
+
+                a_ptrs += BLOCK_SIZE_K * stride_ak
+                if even_Ks:
+                    a = tl.load(
+                        a_ptrs,
+                        mask=token_mask[:, None],
+                        other=0.0,
+                    )
+                else:
+                    a = tl.load(
+                        a_ptrs,
+                        mask=token_mask[:, None] & (offs_k[None, :] < K - (k * 2 + 1) * BLOCK_SIZE_K),
+                        other=0.0,
+                    )
+                b_high = (b >> 4) & 0xF
+                b_high_fp8 = ((b_high - b_q4_zero) * b_q4_scale).to(tl.float8e4nv)
+                accumulator = tl.dot(a, b_high_fp8, acc=accumulator)
         elif use_fp8_w8a8:
             if group_k > 0 and group_n > 0:
                 k_start = k * BLOCK_SIZE_K
@@ -216,7 +341,7 @@ def fused_moe_kernel(
         accumulator = accumulator * moe_weight[:, None]
     if use_int8_w8a16:
         accumulator = (accumulator * b_scale).to(compute_type)
-    elif use_fp8_w8a8:
+    elif use_fp8_w8a8 or use_int4_w4a8:
         if group_k > 0 and group_n > 0:
             accumulator = accumulator.to(compute_type)
         else:
@@ -462,6 +587,8 @@ def invoke_fused_moe_kernel(
     C: torch.Tensor,
     A_scale: Optional[torch.Tensor],
     B_scale: Optional[torch.Tensor],
+    B_q4_scale: Optional[torch.Tensor],
+    B_q4_zero: Optional[torch.Tensor],
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     sorted_token_ids: torch.Tensor,
@@ -471,6 +598,7 @@ def invoke_fused_moe_kernel(
     top_k: int,
     config: Dict[str, Any],
     compute_type: tl.dtype,
+    use_int4_w4a8: bool,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
     block_shape: Optional[List[int]] = None,
@@ -479,7 +607,19 @@ def invoke_fused_moe_kernel(
     assert sorted_token_ids.stride(0) == 1
 
     padded_size = 0
-    if use_fp8_w8a8:
+    if use_int4_w4a8:
+        assert B_scale is not None
+        if block_shape is None:
+            padded_size = padding_size
+            A, A_scale = ops.scaled_fp8_quant(A, A_scale)
+        else:
+            assert len(block_shape) == 2
+            block_n, block_k = block_shape[0], block_shape[1]
+            A, A_scale = per_token_group_quant_fp8(A, block_k)
+            assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
+            assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
+            assert triton.cdiv(B.shape[-1] * 2, block_k) == B_scale.shape[-1]
+    elif use_fp8_w8a8:
         assert B_scale is not None
         if block_shape is None:
             padded_size = padding_size
@@ -502,11 +642,18 @@ def invoke_fused_moe_kernel(
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
 
-    K = B.shape[2] - padded_size
-    if K % config["BLOCK_SIZE_K"] == 0:
-        even_Ks = True
+    K = A.shape[1] - padded_size
+    HALF_K = (K + 1) // 2
+    if use_int4_w4a8:
+        if HALF_K % config["BLOCK_SIZE_K"] == 0:
+            even_Ks = True
+        else:
+            even_Ks = False
     else:
-        even_Ks = False
+        if K % config["BLOCK_SIZE_K"] == 0:
+            even_Ks = True
+        else:
+            even_Ks = False
 
     fused_moe_kernel[grid](
         A,
@@ -514,12 +661,15 @@ def invoke_fused_moe_kernel(
         C,
         A_scale,
         B_scale,
+        B_q4_scale,
+        B_q4_zero,
         topk_weights,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
         B.shape[1],
-        B.shape[2] - padded_size,
+        K,
+        HALF_K,
         sorted_token_ids.shape[0],
         topk_ids.numel(),
         A.stride(0),
@@ -534,11 +684,18 @@ def invoke_fused_moe_kernel(
         B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
         B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
         B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+        B_q4_scale.stride(0) if B_q4_scale is not None else 0,
+        B_q4_scale.stride(2) if B_q4_scale is not None else 0,
+        B_q4_scale.stride(1) if B_q4_scale is not None else 0,
+        B_q4_zero.stride(0) if B_q4_zero is not None else 0,
+        B_q4_zero.stride(2) if B_q4_zero is not None else 0,
+        B_q4_zero.stride(1) if B_q4_zero is not None else 0,
         0 if block_shape is None else block_shape[0],
         0 if block_shape is None else block_shape[1],
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         compute_type=compute_type,
+        use_int4_w4a8=use_int4_w4a8,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         even_Ks=even_Ks,
@@ -609,7 +766,27 @@ def get_default_config(
     is_marlin: bool,
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
-    if dtype == "fp8_w8a8":
+    if dtype == "int4_w4a8":
+        if block_shape is None:
+            config = {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 2 if is_hip_flag else 4,
+            }
+        else:
+            # Block-wise quant: BLOCK_SIZE_K must be divisable by block_shape[1]
+            config = {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": block_shape[0],
+                "BLOCK_SIZE_K": block_shape[1],
+                "GROUP_SIZE_M": 32,
+                "num_warps": 4,
+                "num_stages": 2 if is_hip_flag else 3,
+            }
+    elif dtype == "fp8_w8a8":
         if block_shape is None:
             config = {
                 "BLOCK_SIZE_M": 128,
@@ -691,10 +868,13 @@ def try_get_optimal_moe_config(
 
 def get_config_dtype_str(
     dtype: torch.dtype,
+    use_int4_w4a8: Optional[bool] = False,
     use_int8_w8a16: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
 ):
-    if use_fp8_w8a8:
+    if use_int4_w4a8:
+        return "int4_w4a8"
+    elif use_fp8_w8a8:
         return "fp8_w8a8"
     elif use_int8_w8a16:
         return "int8_w8a16"
@@ -712,12 +892,17 @@ def inplace_fused_experts(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str = "silu",
+    use_int4_w4a8: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    w1_q4_scale: Optional[torch.Tensor] = None,
+    w1_q4_zero: Optional[torch.Tensor] = None,
+    w2_q4_scale: Optional[torch.Tensor] = None,
+    w2_q4_zero: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
 ) -> None:
     fused_experts_impl(
@@ -728,12 +913,17 @@ def inplace_fused_experts(
         topk_ids,
         True,
         activation,
+        use_int4_w4a8,
         use_fp8_w8a8,
         use_int8_w8a16,
         w1_scale,
         w2_scale,
         a1_scale,
         a2_scale,
+        w1_q4_scale,
+        w1_q4_zero,
+        w2_q4_scale,
+        w2_q4_zero,
         block_shape,
     )
 
@@ -745,12 +935,17 @@ def inplace_fused_experts_fake(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str = "silu",
+    use_int4_w4a8: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    w1_q4_scale: Optional[torch.Tensor] = None,
+    w1_q4_zero: Optional[torch.Tensor] = None,
+    w2_q4_scale: Optional[torch.Tensor] = None,
+    w2_q4_zero: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
 ) -> None:
     pass
@@ -771,12 +966,17 @@ def outplace_fused_experts(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str = "silu",
+    use_int4_w4a8: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    w1_q4_scale: Optional[torch.Tensor] = None,
+    w1_q4_zero: Optional[torch.Tensor] = None,
+    w2_q4_scale: Optional[torch.Tensor] = None,
+    w2_q4_zero: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
@@ -787,12 +987,17 @@ def outplace_fused_experts(
         topk_ids,
         False,
         activation,
+        use_int4_w4a8,
         use_fp8_w8a8,
         use_int8_w8a16,
         w1_scale,
         w2_scale,
         a1_scale,
         a2_scale,
+        w1_q4_scale,
+        w1_q4_zero,
+        w2_q4_scale,
+        w2_q4_zero,
         block_shape,
     )
 
@@ -810,6 +1015,10 @@ def outplace_fused_experts_fake(
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    w1_q4_scale: Optional[torch.Tensor] = None,
+    w1_q4_zero: Optional[torch.Tensor] = None,
+    w2_q4_scale: Optional[torch.Tensor] = None,
+    w2_q4_zero: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
@@ -831,12 +1040,17 @@ def fused_experts(
     topk_ids: torch.Tensor,
     inplace: bool = False,
     activation: str = "silu",
+    use_int4_w4a8: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    w1_q4_scale: Optional[torch.Tensor] = None,
+    w1_q4_zero: Optional[torch.Tensor] = None,
+    w2_q4_scale: Optional[torch.Tensor] = None,
+    w2_q4_zero: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
 ):
     if inplace:
@@ -847,12 +1061,17 @@ def fused_experts(
             topk_weights,
             topk_ids,
             activation,
+            use_int4_w4a8,
             use_fp8_w8a8,
             use_int8_w8a16,
             w1_scale,
             w2_scale,
             a1_scale,
             a2_scale,
+            w1_q4_scale,
+            w1_q4_zero,
+            w2_q4_scale,
+            w2_q4_zero,
             block_shape,
         )
         return hidden_states
@@ -864,12 +1083,17 @@ def fused_experts(
             topk_weights,
             topk_ids,
             activation,
+            use_int4_w4a8,
             use_fp8_w8a8,
             use_int8_w8a16,
             w1_scale,
             w2_scale,
             a1_scale,
             a2_scale,
+            w1_q4_scale,
+            w1_q4_zero,
+            w2_q4_scale,
+            w2_q4_zero,
             block_shape,
         )
 
@@ -882,20 +1106,28 @@ def fused_experts_impl(
     topk_ids: torch.Tensor,
     inplace: bool = False,
     activation: str = "silu",
+    use_int4_w4a8: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    w1_q4_scale: Optional[torch.Tensor] = None,
+    w1_q4_zero: Optional[torch.Tensor] = None,
+    w2_q4_scale: Optional[torch.Tensor] = None,
+    w2_q4_zero: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
 ):
     padded_size = padding_size
-    if not use_fp8_w8a8 or block_shape is not None:
+    if (not use_fp8_w8a8 and not use_int4_w4a8) or block_shape is not None:
         padded_size = 0
 
     # Check constraints.
-    assert hidden_states.shape[1] == w1.shape[2] - padded_size, "Hidden size mismatch"
+    if use_int4_w4a8:
+        assert hidden_states.shape[1] == w1.shape[2] * 2 - padded_size, "Hidden size mismatch"
+    else:
+        assert hidden_states.shape[1] == w1.shape[2] - padded_size, "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -909,6 +1141,7 @@ def fused_experts_impl(
     CHUNK_SIZE = 64 * 1024
     M = min(num_tokens, CHUNK_SIZE)
     config_dtype = get_config_dtype_str(
+        use_int4_w4a8=use_int4_w4a8,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         dtype=hidden_states.dtype,
@@ -982,6 +1215,8 @@ def fused_experts_impl(
             intermediate_cache1,
             a1_scale,
             w1_scale,
+            w1_q4_scale,
+            w1_q4_zero,
             curr_topk_weights,
             curr_topk_ids,
             sorted_token_ids,
@@ -991,15 +1226,22 @@ def fused_experts_impl(
             topk_ids.shape[1],
             config,
             compute_type=compute_type,
+            use_int4_w4a8=use_int4_w4a8,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             block_shape=block_shape,
         )
 
         if activation == "silu":
-            ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+            if _is_cuda:
+                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            else:
+                ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
         elif activation == "gelu":
-            ops.gelu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+            if _is_cuda:
+                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            else:
+                ops.gelu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
 
@@ -1009,6 +1251,8 @@ def fused_experts_impl(
             intermediate_cache3,
             a2_scale,
             w2_scale,
+            w2_q4_scale,
+            w2_q4_zero,
             curr_topk_weights,
             curr_topk_ids,
             sorted_token_ids,
@@ -1018,6 +1262,7 @@ def fused_experts_impl(
             1,
             config,
             compute_type=compute_type,
+            use_int4_w4a8=use_int4_w4a8,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             block_shape=block_shape,
@@ -1062,12 +1307,17 @@ def fused_moe(
     num_expert_group: Optional[int] = None,
     topk_group: Optional[int] = None,
     custom_routing_function: Optional[Callable] = None,
+    use_int4_w4a8: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    w1_q4_scale: Optional[torch.Tensor] = None,
+    w1_q4_zero: Optional[torch.Tensor] = None,
+    w2_q4_scale: Optional[torch.Tensor] = None,
+    w2_q4_zero: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """
@@ -1128,11 +1378,16 @@ def fused_moe(
         topk_ids,
         inplace=inplace,
         activation=activation,
+        use_int4_w4a8=use_int4_w4a8,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
+        w1_q4_scale=w1_q4_scale,
+        w1_q4_zero=w1_q4_zero,
+        w2_q4_scale=w2_q4_scale,
+        w2_q4_zero=w2_q4_zero,
         block_shape=block_shape,
     )
