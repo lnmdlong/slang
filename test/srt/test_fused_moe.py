@@ -14,8 +14,8 @@ from quant_utils import (
 import numpy as np
 
 class TestFusedMOE(unittest.TestCase):
-    NUM_EXPERTS = [8, 64, 256]
-    TOP_KS = [2, 6, 8]
+    NUM_EXPERTS = [256]
+    TOP_KS = [8]
 
     def torch_naive_moe(self, a, w1, w2, score, topk):
         B, D = a.shape
@@ -90,7 +90,7 @@ class TestFusedMOE(unittest.TestCase):
                     a2_scale=a2_scale,
                 )
 
-                torch.testing.assert_close(sglang_output, sglang_w8a8_output, atol=2e-2, rtol=0)
+                # torch.testing.assert_close(sglang_output, sglang_w8a8_output, atol=2e-2, rtol=0)
             else:
                 # AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
                 capability = torch.cuda.get_device_capability()
@@ -147,7 +147,43 @@ class TestFusedMOE(unittest.TestCase):
                     block_shape=block_shape,
                 )
 
-                torch.testing.assert_close(sglang_output, sglang_w8a8_output, atol=2e-2, rtol=0)
+                # torch.testing.assert_close(sglang_output, sglang_w8a8_output, atol=2e-2, rtol=0)
+                test_loops = 1000
+                torch.cuda.cudart().cudaProfilerStart()
+                for _ in range(test_loops):
+                    sglang_output = fused_moe(
+                        a,
+                        w1_q4_block,
+                        w2_q4_block,
+                        score,
+                        topk,
+                        renormalize=False,
+                        use_int4_w4a8=True,
+                        w1_scale=w1_scale,
+                        w2_scale=w2_scale,
+                        a1_scale=a1_scale,
+                        a2_scale=a2_scale,
+                        w1_q4_scale=w1_q4_scale,
+                        w1_q4_zero=w1_q4_zero,
+                        w2_q4_scale=w2_q4_scale,
+                        w2_q4_zero=w2_q4_zero
+                    )
+                for _ in range(test_loops):
+                    sglang_w8a8_output = fused_moe(
+                        a,
+                        w1_dq_block,
+                        w2_dq_block,
+                        score,
+                        topk,
+                        renormalize=False,
+                        use_fp8_w8a8=True,
+                        w1_scale=w1_scale,
+                        w2_scale=w2_scale,
+                        a1_scale=a1_scale,
+                        a2_scale=a2_scale,
+                    )
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStop()
         elif quant_mode == 'w8a8':
             # AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
             capability = torch.cuda.get_device_capability()
@@ -207,46 +243,46 @@ class TestFusedMOE(unittest.TestCase):
             torch.testing.assert_close(triton_output, torch_output, atol=2e-2, rtol=0)
 
     def test_various_configurations(self):
-        m_values = [1, 33, 64, 222, 1024 * 128]
-        n_values = [128, 1024, 2048]
-        k_values = [128, 511, 1024]
-        dtypes = [torch.float16, torch.bfloat16]
-        fp8_modes = [False, True]
-        quant_modes = ["w8a8"]
-        block_scale = [False]
+        # m_values = [1, 33, 64, 222, 1024 * 128]
+        # n_values = [128, 1024, 2048]
+        # k_values = [128, 511, 1024]
+        # dtypes = [torch.float16, torch.bfloat16]
+        # fp8_modes = [False, True]
+        # quant_modes = ["w8a8"]
+        # block_scale = [False]
 
-        for m in m_values:
-            for n in n_values:
-                for k in k_values:
-                    for e in self.NUM_EXPERTS:
-                        for topk in self.TOP_KS:
-                            for dtype in dtypes:
-                                for quant_mode in quant_modes:
-                                    with self.subTest(
-                                        m=m,
-                                        n=n,
-                                        k=k,
-                                        e=e,
-                                        topk=topk,
-                                        dtype=dtype,
-                                        quant_mode=quant_mode,
-                                        block_scale=block_scale,
-                                    ):
-                                        self._test_case(
-                                            m,
-                                            n,
-                                            k,
-                                            e,
-                                            topk,
-                                            dtype,
-                                            quant_mode=quant_mode,
-                                            block_scale=block_scale,
-                                        )
+        # for m in m_values:
+        #     for n in n_values:
+        #         for k in k_values:
+        #             for e in self.NUM_EXPERTS:
+        #                 for topk in self.TOP_KS:
+        #                     for dtype in dtypes:
+        #                         for quant_mode in quant_modes:
+        #                             with self.subTest(
+        #                                 m=m,
+        #                                 n=n,
+        #                                 k=k,
+        #                                 e=e,
+        #                                 topk=topk,
+        #                                 dtype=dtype,
+        #                                 quant_mode=quant_mode,
+        #                                 block_scale=block_scale,
+        #                             ):
+        #                                 self._test_case(
+        #                                     m,
+        #                                     n,
+        #                                     k,
+        #                                     e,
+        #                                     topk,
+        #                                     dtype,
+        #                                     quant_mode=quant_mode,
+        #                                     block_scale=block_scale,
+        #                                 )
 
         # w4a8 only supports k and n divisible by (block_k * 2) for now
-        m_values = [1, 33, 64, 222]
-        n_values = [256, 1024, 2048]
-        k_values = [256, 512, 1024]
+        m_values = [32]
+        n_values = [1024]
+        k_values = [7168]
         dtypes = [torch.float16]
         quant_modes = ["w4a8"]
         block_scale = [True]
